@@ -2,67 +2,94 @@
 #include <linux/kernel.h>    // included for KERN_INFO
 #include <linux/init.h>      // included for __init and __exit macros
 #include <linux/timer.h>
-#include <linux/proc_fs.h>
+#include <linux/sysfs.h>
 #include <linux/uaccess.h>
-#include <linux/miscdevice.h>
+#include <linux/slab.h>
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("/sys timer module");
 
+struct interval_attr {
+    struct attribute attr;
+    int value;
+};
+#define parent_interval_attr(x) container_of(x, struct interval_attr, attr)
+
 static struct timer_list my_timer;
-static int my_timer_interval = 2000;
+
+static struct interval_attr timer_interval = {
+    .attr.name="interval",
+    .attr.mode = 0666,
+    .value = 2000,
+};
+
+static struct attribute *attr_array[] = {
+    &timer_interval.attr,
+    NULL
+};
+
+static ssize_t interval_show(struct kobject *kobj, struct attribute *attr, char *buf)
+{
+    struct interval_attr *a = parent_interval_attr(attr);
+    return scnprintf(buf, PAGE_SIZE, "%d\n", a->value / 1000);
+}
+
+static ssize_t interval_store(struct kobject *kobj, struct attribute *attr, const char *buf, size_t len)
+{
+    struct interval_attr *a = parent_interval_attr(attr);
+    sscanf(buf, "%d", &a->value);
+    a->value *= 1000;
+    return len;
+}
+
+static struct sysfs_ops interval_attr_ops = {
+    .show = interval_show,
+    .store = interval_store,
+};
+
+static struct kobj_type timer_kobj_type = {
+    .sysfs_ops = &interval_attr_ops,
+    .default_attrs = attr_array,
+};
 
 void timer_callback( unsigned long data )
 {
     printk("timer_callback called\n");
-    mod_timer(&my_timer, jiffies + msecs_to_jiffies(my_timer_interval));        //restart timer
+    mod_timer(&my_timer, jiffies + msecs_to_jiffies(timer_interval.value));        //restart timer
 }
 
-static ssize_t timer_write_callback(struct file *file, const char *buf, size_t count, loff_t *ppos)
-{
-    char read_buf[128];
-    int read_buf_size = 128;
-
-    if (count < read_buf_size)
-        read_buf_size = count;
-    if (copy_from_user(read_buf, buf, read_buf_size))
-        return -EINVAL;
-
-    if (sscanf(buf, "%d", &my_timer_interval) == 1) {
-        my_timer_interval *= 1000;
-        mod_timer(&my_timer, jiffies + msecs_to_jiffies(my_timer_interval));    // activate timer
-    } else {
-        printk("Wrong input format: %s\n", buf);
-    }
-
-    return read_buf_size;
-}
-
-static const struct file_operations timer_fops = {
-    .owner = THIS_MODULE,
-    .write = timer_write_callback,
-};
-
-static struct miscdevice timer_dev = {
-    .minor = MISC_DYNAMIC_MINOR,
-    .name = "my_timer",
-    &timer_fops,
-};
-
+struct kobject *timer_kobj;
 static int __init timer_init(void)
 {
-    misc_register(&timer_dev);
     setup_timer(&my_timer, timer_callback, 0);
+    mod_timer(&my_timer, jiffies + msecs_to_jiffies(timer_interval.value));
+    //kobject_init(&timer_kobj);
+    timer_kobj = kzalloc(sizeof(*timer_kobj), GFP_KERNEL);
+    if (timer_kobj) {
+        kobject_init(timer_kobj, &timer_kobj_type);
+        if (kobject_add(timer_kobj, NULL, "%s", "timer")) {
+             printk("Sysfs creation failed\n");
+             kobject_put(timer_kobj);
+             timer_kobj = NULL;
+             return -1;
+        }
+    }
+
     printk(KERN_INFO "Timer module loaded\n");
     return 0;
 }
 
 static void __exit timer_cleanup(void)
 {
-    misc_deregister(&timer_dev);
     del_timer(&my_timer);
+    if (timer_kobj) {
+        kobject_put(timer_kobj);
+        kfree(timer_kobj);
+    }
     printk(KERN_INFO "Timer module unloaded\n");
 }
 
 module_init(timer_init);
 module_exit(timer_cleanup);
+
+// http://lwn.net/Articles/54651/
